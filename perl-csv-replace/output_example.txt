@@ -1,0 +1,4 @@
+This script was developped by Alexandre Louisnard from France.
+In France, Grenoble, 2017.
+Use -i option and don't worry wiTH the CASE !!!!
+Nothing to worry with accents and strange ponctuation (except the CSV separator that you can change with -s option ;)!

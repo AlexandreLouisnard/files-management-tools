@@ -1,0 +1,4 @@
+This script was developped by the developer's first name and the developer's last name from country.
+In country, CITY, year.
+Use -i option or beware of the cAse!!
+Beware of the accéèênts and p0%nctµ@tion!
