@@ -9,7 +9,7 @@ import subprocess
 # A summary is printed at the end: what has been pushed, the errors, the folders that are not backed up and the Git LFS files.
 
 
-MAX_PUSH_SIZE = 500000000 # 500 Mo, Github max size push limit is 2 Go but such big pushes time out (HTTP 408) on a slow connection
+MAX_PUSH_SIZE = 150000000 # 150 Mo, Github max size push limit is 2 Go but big pushes time out (HTTP 408) on a slow connection
 PUSH_ATTEMPTS = 3 # A push may fail because of a temporary network error (timeout, DNS...) => retry
 PUSH_RETRY_DELAY = 30 # Seconds
 LFS_MIN_FILE_SIZE = 100000000 # 100 Mo, Github rejects bigger files unless they are stored with Git LFS
