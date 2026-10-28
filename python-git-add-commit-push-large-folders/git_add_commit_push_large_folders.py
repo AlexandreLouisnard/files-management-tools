@@ -1,11 +1,14 @@
 import os
 import sys
+import stat
 import time
+import shutil
 import subprocess
 
 # The objective is to add, commit and push all files/folders of the GIT repositories found in root_path, taking into account the Github limits:
 # - max 2 Go per push => the changes are split into several commits, pushed one by one
 # - max 100 Mo per file => bigger files are stored with Git LFS
+# Once a repo is pushed, its .git folder can be shrunk: it doesn't need to keep a 2nd copy of the files, they are on Github.
 # A summary is printed at the end: what has been pushed, the errors, the folders that are not backed up and the Git LFS files.
 
 
@@ -15,6 +18,8 @@ PUSH_RETRY_DELAY = 30 # Seconds
 LFS_MIN_FILE_SIZE = 100000000 # 100 Mo, Github rejects bigger files unless they are stored with Git LFS
 LFS_MAX_FILE_SIZE = 2000000000 # 2 Go, Github max Git LFS file size (free plan)
 LFS_FREE_QUOTA = 10 * 1024**3 # 10 Gio, Github free Git LFS storage, shared by all the repos of the account
+SHRINK_GIT_FOLDER = True # After a verified push, .git is replaced by a partial clone without the files content (they are on Github, git downloads them back if needed)
+SHRINK_MIN_SIZE = 50000000 # 50 Mo, .git is shrunk only if it is bigger
 MAX_DEPTH_WITHOUT_GIT = 1 # Max depth to explore from the root dir, before stopping or finding a git repo
 REMOTE = 'origin'
 BRANCH = 'master'
@@ -52,7 +57,7 @@ def find_repos(path, depth=0):
 
 def sync_repo(repo_path):
     result = {'name': os.path.basename(os.path.normpath(repo_path)), 'status': '', 'error': '', 'commits': 0, 'files': 0, 'size': 0,
-              'new_lfs_files': [], 'lfs_files': [], 'skipped_files': []}
+              'new_lfs_files': [], 'lfs_files': [], 'skipped_files': [], 'freed': 0}
     print(f'\n=== {result["name"]} ===')
     try:
         changes = get_changes(repo_path)
@@ -80,9 +85,12 @@ def sync_repo(repo_path):
             remote_head, pushed = push_unpushed_commits(repo_path, remote_head)
         verify(repo_path, result)
         result['status'] = 'pushed' if pushed else 'up to date'
+        if SHRINK_GIT_FOLDER and get_dir_size(os.path.join(repo_path, '.git')) > SHRINK_MIN_SIZE:
+            result['freed'] = shrink_git_folder(repo_path)
     except GitError as e:
         print(f'ERROR: {e}')
-        result['status'] = 'ERROR'
+        # If only the shrink failed, the repo is backed up anyway
+        result['status'] = result['status'] or 'ERROR'
         result['error'] = str(e)
     result['lfs_files'] = get_lfs_files(repo_path)
     return result
@@ -133,10 +141,17 @@ def split_in_batches(changes):
 def git_commit(repo_path, changes, lfs_files):
     paths = [path for path, _ in changes]
     git(repo_path, 'add', '--pathspec-from-file=-', '--pathspec-file-nul', input='\0'.join(paths))
-    if git(repo_path, 'diff', '--cached', '--quiet', check=False).returncode == 0:
+    # --no-renames: the renames detection would read (so download, in a shrunk .git) the content of the deleted files
+    if git(repo_path, 'diff', '--cached', '--quiet', '--no-renames', check=False).returncode == 0:
         print('Nothing to commit')
         return False
-    git(repo_path, 'commit', '-q', '-m', commit_message(paths, lfs_files))
+    # Low level commands instead of "git commit": in a shrunk .git, "git commit" would download all the unchanged files of the changed
+    # folders, only to check that they exist ("write-tree --missing-ok" skips this check)
+    message = commit_message(paths, lfs_files)
+    tree = git(repo_path, 'write-tree', '--missing-ok').stdout.strip()
+    parent = ['-p', 'HEAD'] if has_commits(repo_path) else []
+    commit = git(repo_path, 'commit-tree', tree, *parent, '-m', message).stdout.strip()
+    git(repo_path, 'update-ref', '-m', f'commit: {message.splitlines()[0]}', 'HEAD', commit)
     return True
 
 def commit_message(paths, lfs_files):
@@ -195,13 +210,71 @@ def uses_lfs(repo_path):
 
 def get_lfs_files(repo_path):
     # Returns the (path, size) of the committed Git LFS files
+    # ("git lfs ls-files" is not used: it reads the content of all the files, so it would download them all in a shrunk .git)
     if not uses_lfs(repo_path):
         return []
+    paths = git(repo_path, 'ls-files', '-z', check=False).stdout
+    output = git(repo_path, 'check-attr', '-z', '--stdin', 'filter', input=paths, check=False).stdout.split('\0')
     files = []
-    for path in git(repo_path, 'lfs', 'ls-files', '--name-only', check=False).stdout.splitlines():
-        full_path = os.path.join(repo_path, path)
-        files.append((path, os.path.getsize(full_path) if os.path.isfile(full_path) else 0))
+    # check-attr output: path, attribute, value, path, attribute, value...
+    for path, value in zip(output[0::3], output[2::3]):
+        if value == 'lfs':
+            full_path = os.path.join(repo_path, path)
+            files.append((path, os.path.getsize(full_path) if os.path.isfile(full_path) else 0))
     return files
+
+def shrink_git_folder(repo_path):
+    # The files are on Github, so .git doesn't need to keep a copy of them: .git is replaced by a partial clone of the Github repo,
+    # which only contains the history (commits, folders), git downloads back the content of a file from Github if it needs it (ex: git restore).
+    # The old .git is deleted only if the repo is clean with the new one, else it is restored. Returns the freed size.
+    name = os.path.basename(os.path.normpath(repo_path))
+    git_dir = os.path.join(repo_path, '.git')
+    tmp_dir = os.path.join(os.path.dirname(os.path.abspath(repo_path)), f'.{name}.shrink') # Starts with '.' => ignored by find_repos()
+    new_git_dir = os.path.join(tmp_dir, 'new', '.git')
+    old_git_dir = os.path.join(tmp_dir, 'old.git')
+    if os.path.exists(tmp_dir):
+        raise GitError(f'shrink: "{tmp_dir}" already exists (interrupted shrink?) => check it, it may contain the old .git')
+    print('Shrinking .git (partial clone)')
+    size_before = get_dir_size(git_dir)
+    url = git(repo_path, 'remote', 'get-url', REMOTE).stdout.strip()
+    head = git(repo_path, 'rev-parse', 'HEAD').stdout.strip()
+    git(repo_path, 'clone', '-q', '--filter=blob:none', '--no-checkout', '--branch', BRANCH, url, os.path.join(tmp_dir, 'new'))
+    if git(os.path.join(tmp_dir, 'new'), 'rev-parse', 'HEAD').stdout.strip() != head:
+        remove_dir(tmp_dir)
+        raise GitError('shrink: the Github repo is not the same as the local one')
+    # Same commit => the old index is valid, and git doesn't have to read all the files again to rebuild it
+    shutil.copy2(os.path.join(git_dir, 'index'), os.path.join(new_git_dir, 'index'))
+    try:
+        os.rename(git_dir, old_git_dir)
+    except OSError as e:
+        remove_dir(tmp_dir)
+        raise GitError(f'shrink: cannot move .git (used by another program?): {e}')
+    try:
+        os.rename(new_git_dir, git_dir)
+        if uses_lfs(repo_path):
+            git(repo_path, 'lfs', 'install', '--local')
+        if get_changes(repo_path) or git(repo_path, 'rev-parse', 'HEAD').stdout.strip() != head:
+            raise GitError('the repo is not clean with the new .git')
+    except (OSError, GitError) as e:
+        if os.path.exists(git_dir):
+            os.rename(git_dir, os.path.join(tmp_dir, 'failed.git'))
+        os.rename(old_git_dir, git_dir)
+        remove_dir(tmp_dir)
+        raise GitError(f'shrink failed, the old .git has been restored: {e}')
+    remove_dir(tmp_dir)
+    freed = max(0, size_before - get_dir_size(git_dir))
+    print(f'=> {format_size(freed)} freed')
+    return freed
+
+def get_dir_size(path):
+    return sum(os.path.getsize(os.path.join(root, file)) for root, _, files in os.walk(path) for file in files)
+
+def remove_dir(path):
+    # Git makes its objects read-only, which prevents Windows from deleting them
+    def make_writable_and_retry(function, path, _):
+        os.chmod(path, stat.S_IWRITE)
+        function(path)
+    shutil.rmtree(path, onexc=make_writable_and_retry)
 
 def git(repo_path, *args, input=None, check=True):
     # Runs a git command (paths are never interpreted as patterns), raises GitError if it fails
@@ -226,8 +299,10 @@ def print_summary(results, not_repos):
     print('\n' + '=' * 35 + ' SUMMARY ' + '=' * 35)
     problems = 0
     for r in results:
-        details = f'{r["commits"]} commits, {r["files"]} files, {format_size(r["size"])}' if r['commits'] else ''
-        print(f'{r["name"]:<12} {r["status"]:<11} {details}')
+        details = [f'{r["commits"]} commits, {r["files"]} files, {format_size(r["size"])}'] if r['commits'] else []
+        if r['freed']:
+            details.append(f'.git shrunk: {format_size(r["freed"])} freed')
+        print(f'{r["name"]:<12} {r["status"]:<11} {", ".join(details)}')
         if r['error']:
             problems += 1
             print(f'{"":<12} => {r["error"]}')
@@ -254,6 +329,10 @@ def print_summary(results, not_repos):
             print('  => ERROR: free Git LFS quota exceeded, Github will refuse the pushes')
         elif lfs_size > 0.8 * LFS_FREE_QUOTA:
             print('  => WARNING: the free Git LFS quota is almost full')
+
+    freed = sum(r['freed'] for r in results)
+    if freed:
+        print(f'\nDisk space freed by shrinking the .git folders: {format_size(freed)}')
 
     if problems:
         print(f'\n=> {problems} PROBLEM(S), see above')
